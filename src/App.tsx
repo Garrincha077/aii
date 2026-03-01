@@ -15,19 +15,54 @@ export default function App() {
   const [isGeneratingFullAudio, setIsGeneratingFullAudio] = useState(false);
   const [generationProgress, setGenerationProgress] = useState(0);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [currentChunkIndex, setCurrentChunkIndex] = useState(0);
+  const [pageChunks, setPageChunks] = useState<string[]>([]);
+
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const activeJobIdRef = useRef(0);
+
+  const invalidateJobs = () => {
+    activeJobIdRef.current += 1;
+    return activeJobIdRef.current;
+  };
+
+  const stopAudioPlayback = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+    setIsPlaying(false);
+    setAudioUrl(null);
+  };
+
+  const cancelPagePlayback = () => {
+    invalidateJobs();
+    stopAudioPlayback();
+    setIsGeneratingAudio(false);
+  };
+
+  const cancelFullAudiobookGeneration = () => {
+    invalidateJobs();
+    setIsGeneratingFullAudio(false);
+    setGenerationProgress(0);
+    setError(null);
+  };
 
   const downloadFullAudiobook = async () => {
     if (pagesText.length === 0 || !file) return;
-    
+
+    const jobId = invalidateJobs();
+    stopAudioPlayback();
+    setIsGeneratingAudio(false);
     setIsGeneratingFullAudio(true);
     setGenerationProgress(0);
     setError(null);
-    
+
     try {
       const allPcmChunks: string[] = [];
-      let totalChunks = 0;
-      
-      // First, calculate total chunks
+
       const allTextChunks: string[] = [];
       for (let i = 0; i < pagesText.length; i++) {
         const text = pagesText[i];
@@ -35,49 +70,51 @@ export default function App() {
         const chunks = chunkText(text, 1000);
         allTextChunks.push(...chunks);
       }
-      
-      totalChunks = allTextChunks.length;
-      
+
+      const totalChunks = allTextChunks.length;
+
       if (totalChunks === 0) {
         throw new Error('No audio could be generated from this document.');
       }
 
       for (let i = 0; i < allTextChunks.length; i++) {
+        if (activeJobIdRef.current !== jobId) return;
+
         const chunk = allTextChunks[i];
         const pcm = await generateSpeechPcm(chunk, voice);
+
+        if (activeJobIdRef.current !== jobId) return;
+
         allPcmChunks.push(pcm);
         setGenerationProgress(Math.round(((i + 1) / totalChunks) * 100));
-        
-        // Add a 4.5 second delay between chunks to respect the 15 RPM free tier limit
-        // Only delay if it's not the last chunk
+
         if (i < allTextChunks.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 4500));
+          if (activeJobIdRef.current !== jobId) return;
         }
       }
-      
+
+      if (activeJobIdRef.current !== jobId) return;
+
       const fullAudioUrl = concatPcmToWav(allPcmChunks, 24000);
-      
-      // Trigger download
+
       const a = document.createElement('a');
       a.href = fullAudioUrl;
-      a.download = `${file.name.replace(/\.[^/.]+$/, "")}-full-audiobook.wav`;
+      a.download = `${file.name.replace(/\.[^/.]+$/, '')}-full-audiobook.wav`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(fullAudioUrl);
-      
     } catch (err: any) {
+      if (activeJobIdRef.current !== jobId) return;
       console.error('Error generating full audiobook:', err);
       setError('Failed to generate full audiobook. Please try again.');
     } finally {
+      if (activeJobIdRef.current !== jobId) return;
       setIsGeneratingFullAudio(false);
       setGenerationProgress(0);
     }
   };
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const audioRef = useRef<HTMLAudioElement>(null);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -87,34 +124,42 @@ export default function App() {
       return;
     }
 
+    const jobId = invalidateJobs();
+    stopAudioPlayback();
+    setIsGeneratingAudio(false);
+    setIsGeneratingFullAudio(false);
+    setGenerationProgress(0);
     setFile(selectedFile);
     setError(null);
     setIsExtracting(true);
     setPagesText([]);
     setCurrentPage(0);
-    setAudioUrl(null);
-    setIsPlaying(false);
 
     try {
       const extractedPages = await extractTextFromPdf(selectedFile);
+      if (activeJobIdRef.current !== jobId) return;
       setPagesText(extractedPages);
     } catch (err: any) {
+      if (activeJobIdRef.current !== jobId) return;
       console.error('Error extracting text:', err);
       setError('Failed to extract text from PDF. Ensure it is a valid text-based PDF.');
     } finally {
+      if (activeJobIdRef.current !== jobId) return;
       setIsExtracting(false);
     }
   };
 
-  const [currentChunkIndex, setCurrentChunkIndex] = useState(0);
-  const [pageChunks, setPageChunks] = useState<string[]>([]);
-
   const playPage = async (pageIndex: number, chunkIndex = 0) => {
     if (pageIndex < 0 || pageIndex >= pagesText.length) return;
-    
+
+    const jobId = chunkIndex === 0 ? invalidateJobs() : activeJobIdRef.current;
+    if (chunkIndex === 0) {
+      stopAudioPlayback();
+    }
+
     setCurrentPage(pageIndex);
     const text = pagesText[pageIndex];
-    
+
     if (!text || text.trim().length === 0) {
       setError('This page appears to be empty or contains no readable text.');
       return;
@@ -125,7 +170,6 @@ export default function App() {
     setCurrentChunkIndex(chunkIndex);
 
     if (chunkIndex >= chunks.length) {
-      // Move to next page if done with chunks
       if (pageIndex < pagesText.length - 1) {
         playPage(pageIndex + 1, 0);
       } else {
@@ -142,14 +186,26 @@ export default function App() {
     try {
       const textToRead = chunks[chunkIndex];
       const url = await generateSpeech(textToRead, voice);
+      if (activeJobIdRef.current !== jobId) return;
       setAudioUrl(url);
       setIsPlaying(true);
     } catch (err: any) {
+      if (activeJobIdRef.current !== jobId) return;
       console.error('Error generating speech:', err);
       setError('Failed to generate audio. Please try again.');
     } finally {
+      if (activeJobIdRef.current !== jobId) return;
       setIsGeneratingAudio(false);
     }
+  };
+
+  const handleVoiceChange = (nextVoice: VoiceName) => {
+    setVoice(nextVoice);
+    invalidateJobs();
+    stopAudioPlayback();
+    setIsGeneratingAudio(false);
+    setIsGeneratingFullAudio(false);
+    setGenerationProgress(0);
   };
 
   useEffect(() => {
@@ -180,7 +236,6 @@ export default function App() {
 
   const handleAudioEnded = () => {
     setIsPlaying(false);
-    // Play next chunk or next page
     playPage(currentPage, currentChunkIndex + 1);
   };
 
@@ -194,12 +249,12 @@ export default function App() {
             </div>
             <h1 className="text-xl font-semibold tracking-tight">PDF to Audiobook</h1>
           </div>
-          
+
           <div className="flex items-center gap-4">
             <label className="text-sm font-medium text-stone-600">Voice:</label>
-            <select 
-              value={voice} 
-              onChange={(e) => setVoice(e.target.value as VoiceName)}
+            <select
+              value={voice}
+              onChange={(e) => handleVoiceChange(e.target.value as VoiceName)}
               className="bg-stone-100 border-none rounded-lg px-3 py-1.5 text-sm font-medium focus:ring-2 focus:ring-stone-900 outline-none cursor-pointer"
             >
               <option value="Kore">Kore (Female)</option>
@@ -225,11 +280,11 @@ export default function App() {
                 </p>
                 <p className="text-sm text-stone-500">PDF files only</p>
               </div>
-              <input 
-                type="file" 
-                className="hidden" 
-                accept="application/pdf" 
-                onChange={handleFileUpload} 
+              <input
+                type="file"
+                className="hidden"
+                accept="application/pdf"
+                onChange={handleFileUpload}
               />
             </label>
           </div>
@@ -259,15 +314,15 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center justify-center gap-4">
-                  <button 
+                  <button
                     onClick={() => playPage(currentPage - 1, 0)}
                     disabled={currentPage === 0 || isExtracting || isGeneratingAudio || isGeneratingFullAudio}
                     className="p-3 rounded-full hover:bg-stone-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-stone-700"
                   >
                     <SkipBack size={24} fill="currentColor" />
                   </button>
-                  
-                  <button 
+
+                  <button
                     onClick={togglePlayPause}
                     disabled={isExtracting || pagesText.length === 0 || isGeneratingFullAudio}
                     className="w-16 h-16 rounded-full bg-stone-900 text-white flex items-center justify-center hover:bg-stone-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg active:scale-95"
@@ -280,8 +335,8 @@ export default function App() {
                       <Play size={28} fill="currentColor" className="ml-1" />
                     )}
                   </button>
-                  
-                  <button 
+
+                  <button
                     onClick={() => playPage(currentPage + 1, 0)}
                     disabled={currentPage === pagesText.length - 1 || isExtracting || isGeneratingAudio || isGeneratingFullAudio}
                     className="p-3 rounded-full hover:bg-stone-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-stone-700"
@@ -291,17 +346,26 @@ export default function App() {
                 </div>
 
                 <div className="mt-6 flex flex-col gap-3">
+                  {(isGeneratingAudio || isPlaying) && (
+                    <button
+                      onClick={cancelPagePlayback}
+                      className="flex items-center justify-center gap-2 px-4 py-2.5 bg-stone-200 hover:bg-stone-300 text-stone-700 rounded-xl text-sm font-medium transition-colors w-full"
+                    >
+                      {isGeneratingAudio ? 'Cancel Page Generation' : 'Stop Playback'}
+                    </button>
+                  )}
+
                   {audioUrl && (
-                    <a 
-                      href={audioUrl} 
-                      download={`${file.name.replace(/\.[^/.]+$/, "")}-page-${currentPage + 1}-part-${currentChunkIndex + 1}.wav`}
+                    <a
+                      href={audioUrl}
+                      download={`${file.name.replace(/\.[^/.]+$/, '')}-page-${currentPage + 1}-part-${currentChunkIndex + 1}.wav`}
                       className="flex items-center justify-center gap-2 px-4 py-2.5 bg-stone-100 hover:bg-stone-200 text-stone-700 rounded-xl text-sm font-medium transition-colors w-full"
                     >
                       <Download size={18} />
                       Download Current Audio
                     </a>
                   )}
-                  
+
                   <button
                     onClick={downloadFullAudiobook}
                     disabled={isExtracting || pagesText.length === 0 || isGeneratingAudio || isGeneratingFullAudio}
@@ -319,12 +383,21 @@ export default function App() {
                       </>
                     )}
                   </button>
+
+                  {isGeneratingFullAudio && (
+                    <button
+                      onClick={cancelFullAudiobookGeneration}
+                      className="flex items-center justify-center gap-2 px-4 py-2.5 bg-stone-200 hover:bg-stone-300 text-stone-700 rounded-xl text-sm font-medium transition-colors w-full"
+                    >
+                      Cancel Full Audiobook Generation
+                    </button>
+                  )}
                 </div>
 
                 {audioUrl && (
-                  <audio 
-                    ref={audioRef} 
-                    src={audioUrl} 
+                  <audio
+                    ref={audioRef}
+                    src={audioUrl}
                     onEnded={handleAudioEnded}
                     onPause={() => setIsPlaying(false)}
                     onPlay={() => setIsPlaying(true)}
@@ -353,7 +426,7 @@ export default function App() {
                     </div>
                   )}
                 </div>
-                
+
                 <div className="p-8 overflow-y-auto flex-1 text-stone-800 leading-relaxed text-lg font-serif">
                   {isExtracting ? (
                     <div className="h-full flex items-center justify-center text-stone-400">
