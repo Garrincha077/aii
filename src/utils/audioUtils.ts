@@ -90,6 +90,14 @@ export function concatPcmToWav(base64PcmList: string[], sampleRate = 24000): str
   return URL.createObjectURL(blob);
 }
 
+export function setNewAudioUrl(oldUrl: string | null, newUrl: string | null): string | null {
+  if (oldUrl) {
+    URL.revokeObjectURL(oldUrl);
+  }
+
+  return newUrl;
+}
+
 function writeString(view: DataView, offset: number, string: string) {
   for (let i = 0; i < string.length; i++) {
     view.setUint8(offset + i, string.charCodeAt(i));

@@ -3,7 +3,7 @@ import { Upload, Play, Pause, SkipBack, SkipForward, FileText, Loader2, Volume2,
 import { extractTextFromPdf } from './services/pdfService';
 import { generateSpeech, generateSpeechPcm, VoiceName } from './services/geminiService';
 import { chunkText } from './utils/textUtils';
-import { concatPcmToWav } from './utils/audioUtils';
+import { concatPcmToWav, setNewAudioUrl } from './utils/audioUtils';
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
@@ -64,7 +64,7 @@ export default function App() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(fullAudioUrl);
+      setNewAudioUrl(fullAudioUrl, null);
       
     } catch (err: any) {
       console.error('Error generating full audiobook:', err);
@@ -78,6 +78,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement>(null);
+  const audioUrlRef = useRef<string | null>(null);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -92,7 +93,8 @@ export default function App() {
     setIsExtracting(true);
     setPagesText([]);
     setCurrentPage(0);
-    setAudioUrl(null);
+    setAudioUrl(setNewAudioUrl(audioUrlRef.current, null));
+    audioUrlRef.current = null;
     setIsPlaying(false);
 
     try {
@@ -136,13 +138,16 @@ export default function App() {
 
     setIsGeneratingAudio(true);
     setError(null);
-    setAudioUrl(null);
+    setAudioUrl(setNewAudioUrl(audioUrlRef.current, null));
+    audioUrlRef.current = null;
     setIsPlaying(false);
 
     try {
       const textToRead = chunks[chunkIndex];
       const url = await generateSpeech(textToRead, voice);
-      setAudioUrl(url);
+      const nextAudioUrl = setNewAudioUrl(audioUrlRef.current, url);
+      audioUrlRef.current = nextAudioUrl;
+      setAudioUrl(nextAudioUrl);
       setIsPlaying(true);
     } catch (err: any) {
       console.error('Error generating speech:', err);
@@ -183,6 +188,13 @@ export default function App() {
     // Play next chunk or next page
     playPage(currentPage, currentChunkIndex + 1);
   };
+
+  useEffect(() => {
+    return () => {
+      const finalAudioUrl = setNewAudioUrl(audioUrlRef.current, null);
+      audioUrlRef.current = finalAudioUrl;
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-stone-50 text-stone-900 font-sans selection:bg-stone-200">
