@@ -1,0 +1,5 @@
+{
+  "name": "PDF to Audiobook",
+  "description": "Convert PDF files into audiobooks using Gemini TTS",
+  "requestFramePermissions": []
+}
