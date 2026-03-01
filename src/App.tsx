@@ -1,6 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Upload, Play, Pause, SkipBack, SkipForward, FileText, Loader2, Volume2, Download } from 'lucide-react';
-import { extractTextFromPdf } from './services/pdfService';
+import {
+  extractTextFromPdf,
+  PdfExtractionError,
+  PdfExtractionMetadata,
+} from './services/pdfService';
 import { generateSpeech, generateSpeechPcm, VoiceName } from './services/geminiService';
 import { chunkText } from './utils/textUtils';
 import { concatPcmToWav } from './utils/audioUtils';
@@ -15,6 +19,7 @@ export default function App() {
   const [isGeneratingFullAudio, setIsGeneratingFullAudio] = useState(false);
   const [generationProgress, setGenerationProgress] = useState(0);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [extractionMetadata, setExtractionMetadata] = useState<PdfExtractionMetadata | null>(null);
 
   const downloadFullAudiobook = async () => {
     if (pagesText.length === 0 || !file) return;
@@ -91,16 +96,31 @@ export default function App() {
     setError(null);
     setIsExtracting(true);
     setPagesText([]);
+    setExtractionMetadata(null);
     setCurrentPage(0);
     setAudioUrl(null);
     setIsPlaying(false);
 
     try {
-      const extractedPages = await extractTextFromPdf(selectedFile);
-      setPagesText(extractedPages);
+      const extractionResult = await extractTextFromPdf(selectedFile);
+      setPagesText(extractionResult.pagesText);
+      setExtractionMetadata(extractionResult.metadata);
     } catch (err: any) {
       console.error('Error extracting text:', err);
-      setError('Failed to extract text from PDF. Ensure it is a valid text-based PDF.');
+
+      if (err instanceof PdfExtractionError) {
+        if (err.code === 'CORRUPT_PDF') {
+          setError('Corrupt PDF detected. Please upload a complete, readable PDF file.');
+        } else if (err.code === 'PASSWORD_PROTECTED_PDF') {
+          setError('This PDF is password-protected. Please unlock it before uploading.');
+        } else if (err.code === 'IMAGE_ONLY_PDF') {
+          setError('This PDF looks scanned/image-only. OCR is required before text-to-speech can work.');
+        } else {
+          setError(err.message);
+        }
+      } else {
+        setError('Failed to extract text from PDF. Ensure it is a valid text-based PDF.');
+      }
     } finally {
       setIsExtracting(false);
     }
@@ -338,6 +358,16 @@ export default function App() {
                   {error}
                 </div>
               )}
+
+              {extractionMetadata?.lowQuality && (
+                <div className="bg-amber-50 text-amber-800 p-4 rounded-xl text-sm border border-amber-200">
+                  <p className="font-medium mb-1">Extraction quality looks low.</p>
+                  <p>
+                    {extractionMetadata.emptyPageCount} empty pages and {extractionMetadata.veryShortPageCount} very short
+                    pages were detected. This file may require OCR (common with scanned PDFs).
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Right Column: Text Content */}
@@ -353,6 +383,14 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {extractionMetadata && (
+                  <div className="px-6 py-2 border-b border-stone-100 bg-stone-50/80 text-xs text-stone-500 flex gap-4 flex-wrap">
+                    <span>Confidence: {(extractionMetadata.extractionConfidence * 100).toFixed(0)}%</span>
+                    <span>Empty pages: {extractionMetadata.emptyPageCount}</span>
+                    <span>Very short pages: {extractionMetadata.veryShortPageCount}</span>
+                  </div>
+                )}
                 
                 <div className="p-8 overflow-y-auto flex-1 text-stone-800 leading-relaxed text-lg font-serif">
                   {isExtracting ? (
