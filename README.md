@@ -8,13 +8,17 @@ This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/589d0400-5288-4a6c-994b-0a589682afac
 
-## Run Locally
+## Project structure
 
-**Prerequisites:**  Node.js
+- `src/`: client-only React + Vite application.
+- No backend/server implementation is currently included.
 
+## Run locally
+
+**Prerequisites:** Node.js
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key.
 3. Run the app:
    `npm run dev`
