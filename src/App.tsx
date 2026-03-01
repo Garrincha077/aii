@@ -1,9 +1,15 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Upload, Play, Pause, SkipBack, SkipForward, FileText, Loader2, Volume2, Download } from 'lucide-react';
 import { extractTextFromPdf } from './services/pdfService';
 import { generateSpeech, generateSpeechPcm, VoiceName } from './services/geminiService';
 import { chunkText } from './utils/textUtils';
 import { concatPcmToWav } from './utils/audioUtils';
+
+type PrefetchedAudio = {
+  pageIndex: number;
+  chunkIndex: number;
+  url: string;
+};
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
@@ -15,29 +21,182 @@ export default function App() {
   const [isGeneratingFullAudio, setIsGeneratingFullAudio] = useState(false);
   const [generationProgress, setGenerationProgress] = useState(0);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const prefetchRef = useRef<PrefetchedAudio | null>(null);
+  const prefetchTokenRef = useRef(0);
+  const audioUrlRef = useRef<string | null>(null);
+
+  const [currentChunkIndex, setCurrentChunkIndex] = useState(0);
+  const [pageChunks, setPageChunks] = useState<string[]>([]);
+
+  const getChunksForPage = useCallback(
+    (pageIndex: number): string[] => {
+      const text = pagesText[pageIndex];
+      if (!text || text.trim().length === 0) return [];
+      return chunkText(text, 1000);
+    },
+    [pagesText],
+  );
+
+  const revokeAudioUrl = (url?: string | null) => {
+    if (url && url.startsWith('blob:')) {
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  const clearPrefetchedAudio = useCallback(() => {
+    if (prefetchRef.current) {
+      revokeAudioUrl(prefetchRef.current.url);
+      prefetchRef.current = null;
+    }
+  }, []);
+
+  const findNextPlayableLocation = useCallback(
+    (pageIndex: number, chunkIndex: number, chunksOnPage: string[]) => {
+      if (chunkIndex + 1 < chunksOnPage.length) {
+        return { pageIndex, chunkIndex: chunkIndex + 1 };
+      }
+
+      for (let nextPageIndex = pageIndex + 1; nextPageIndex < pagesText.length; nextPageIndex++) {
+        const nextPageChunks = getChunksForPage(nextPageIndex);
+        if (nextPageChunks.length > 0) {
+          return { pageIndex: nextPageIndex, chunkIndex: 0 };
+        }
+      }
+
+      return null;
+    },
+    [getChunksForPage, pagesText.length],
+  );
+
+  const startPrefetch = useCallback(
+    async (pageIndex: number, chunkIndex: number, chunksOnPage: string[]) => {
+      const nextLocation = findNextPlayableLocation(pageIndex, chunkIndex, chunksOnPage);
+      if (!nextLocation) {
+        clearPrefetchedAudio();
+        return;
+      }
+
+      if (
+        prefetchRef.current &&
+        prefetchRef.current.pageIndex === nextLocation.pageIndex &&
+        prefetchRef.current.chunkIndex === nextLocation.chunkIndex
+      ) {
+        return;
+      }
+
+      const nextChunks = getChunksForPage(nextLocation.pageIndex);
+      const nextText = nextChunks[nextLocation.chunkIndex];
+      if (!nextText) {
+        return;
+      }
+
+      const token = ++prefetchTokenRef.current;
+
+      try {
+        const url = await generateSpeech(nextText, voice);
+
+        if (token !== prefetchTokenRef.current) {
+          revokeAudioUrl(url);
+          return;
+        }
+
+        clearPrefetchedAudio();
+        prefetchRef.current = {
+          pageIndex: nextLocation.pageIndex,
+          chunkIndex: nextLocation.chunkIndex,
+          url,
+        };
+      } catch (err) {
+        console.warn('Prefetch failed:', err);
+      }
+    },
+    [clearPrefetchedAudio, findNextPlayableLocation, getChunksForPage, voice],
+  );
+
+  const playPage = useCallback(
+    async (pageIndex: number, chunkIndex = 0) => {
+      if (pageIndex < 0 || pageIndex >= pagesText.length) return;
+
+      const chunks = getChunksForPage(pageIndex);
+
+      if (chunks.length === 0) {
+        setError('This page appears to be empty or contains no readable text.');
+        return;
+      }
+
+      if (chunkIndex >= chunks.length) {
+        const nextLocation = findNextPlayableLocation(pageIndex, chunkIndex - 1, chunks);
+        if (nextLocation) {
+          await playPage(nextLocation.pageIndex, nextLocation.chunkIndex);
+        } else {
+          setIsPlaying(false);
+        }
+        return;
+      }
+
+      setCurrentPage(pageIndex);
+      setPageChunks(chunks);
+      setCurrentChunkIndex(chunkIndex);
+      setIsGeneratingAudio(true);
+      setError(null);
+      setIsPlaying(false);
+
+      prefetchTokenRef.current += 1;
+
+      try {
+        let nextAudioUrl: string;
+
+        if (
+          prefetchRef.current &&
+          prefetchRef.current.pageIndex === pageIndex &&
+          prefetchRef.current.chunkIndex === chunkIndex
+        ) {
+          nextAudioUrl = prefetchRef.current.url;
+          prefetchRef.current = null;
+        } else {
+          nextAudioUrl = await generateSpeech(chunks[chunkIndex], voice);
+        }
+
+        revokeAudioUrl(audioUrlRef.current);
+        audioUrlRef.current = nextAudioUrl;
+        setAudioUrl(nextAudioUrl);
+        setIsPlaying(true);
+
+        void startPrefetch(pageIndex, chunkIndex, chunks);
+      } catch (err: any) {
+        console.error('Error generating speech:', err);
+        setError('Failed to generate audio. Please try again.');
+      } finally {
+        setIsGeneratingAudio(false);
+      }
+    },
+    [findNextPlayableLocation, getChunksForPage, pagesText.length, startPrefetch, voice],
+  );
 
   const downloadFullAudiobook = async () => {
     if (pagesText.length === 0 || !file) return;
-    
+
     setIsGeneratingFullAudio(true);
     setGenerationProgress(0);
     setError(null);
-    
+
     try {
       const allPcmChunks: string[] = [];
-      let totalChunks = 0;
-      
-      // First, calculate total chunks
       const allTextChunks: string[] = [];
+
       for (let i = 0; i < pagesText.length; i++) {
         const text = pagesText[i];
         if (!text || text.trim().length === 0) continue;
         const chunks = chunkText(text, 1000);
         allTextChunks.push(...chunks);
       }
-      
-      totalChunks = allTextChunks.length;
-      
+
+      const totalChunks = allTextChunks.length;
+
       if (totalChunks === 0) {
         throw new Error('No audio could be generated from this document.');
       }
@@ -47,25 +206,21 @@ export default function App() {
         const pcm = await generateSpeechPcm(chunk, voice);
         allPcmChunks.push(pcm);
         setGenerationProgress(Math.round(((i + 1) / totalChunks) * 100));
-        
-        // Add a 4.5 second delay between chunks to respect the 15 RPM free tier limit
-        // Only delay if it's not the last chunk
+
         if (i < allTextChunks.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 4500));
+          await new Promise((resolve) => setTimeout(resolve, 4500));
         }
       }
-      
+
       const fullAudioUrl = concatPcmToWav(allPcmChunks, 24000);
-      
-      // Trigger download
+
       const a = document.createElement('a');
       a.href = fullAudioUrl;
-      a.download = `${file.name.replace(/\.[^/.]+$/, "")}-full-audiobook.wav`;
+      a.download = `${file.name.replace(/\.[^/.]+$/, '')}-full-audiobook.wav`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(fullAudioUrl);
-      
     } catch (err: any) {
       console.error('Error generating full audiobook:', err);
       setError('Failed to generate full audiobook. Please try again.');
@@ -74,10 +229,6 @@ export default function App() {
       setGenerationProgress(0);
     }
   };
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const audioRef = useRef<HTMLAudioElement>(null);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -87,11 +238,16 @@ export default function App() {
       return;
     }
 
+    prefetchTokenRef.current += 1;
+    clearPrefetchedAudio();
+
     setFile(selectedFile);
     setError(null);
     setIsExtracting(true);
     setPagesText([]);
     setCurrentPage(0);
+    revokeAudioUrl(audioUrlRef.current);
+    audioUrlRef.current = null;
     setAudioUrl(null);
     setIsPlaying(false);
 
@@ -106,65 +262,32 @@ export default function App() {
     }
   };
 
-  const [currentChunkIndex, setCurrentChunkIndex] = useState(0);
-  const [pageChunks, setPageChunks] = useState<string[]>([]);
-
-  const playPage = async (pageIndex: number, chunkIndex = 0) => {
-    if (pageIndex < 0 || pageIndex >= pagesText.length) return;
-    
-    setCurrentPage(pageIndex);
-    const text = pagesText[pageIndex];
-    
-    if (!text || text.trim().length === 0) {
-      setError('This page appears to be empty or contains no readable text.');
-      return;
-    }
-
-    const chunks = chunkText(text, 1000);
-    setPageChunks(chunks);
-    setCurrentChunkIndex(chunkIndex);
-
-    if (chunkIndex >= chunks.length) {
-      // Move to next page if done with chunks
-      if (pageIndex < pagesText.length - 1) {
-        playPage(pageIndex + 1, 0);
-      } else {
-        setIsPlaying(false);
-      }
-      return;
-    }
-
-    setIsGeneratingAudio(true);
-    setError(null);
-    setAudioUrl(null);
-    setIsPlaying(false);
-
-    try {
-      const textToRead = chunks[chunkIndex];
-      const url = await generateSpeech(textToRead, voice);
-      setAudioUrl(url);
-      setIsPlaying(true);
-    } catch (err: any) {
-      console.error('Error generating speech:', err);
-      setError('Failed to generate audio. Please try again.');
-    } finally {
-      setIsGeneratingAudio(false);
-    }
-  };
-
   useEffect(() => {
     if (audioUrl && audioRef.current) {
-      audioRef.current.play().catch(err => {
+      audioRef.current.play().catch((err) => {
         console.error('Playback failed:', err);
         setIsPlaying(false);
       });
     }
   }, [audioUrl]);
 
+  useEffect(() => {
+    prefetchTokenRef.current += 1;
+    clearPrefetchedAudio();
+  }, [voice, clearPrefetchedAudio]);
+
+  useEffect(() => {
+    return () => {
+      prefetchTokenRef.current += 1;
+      clearPrefetchedAudio();
+      revokeAudioUrl(audioUrlRef.current);
+    };
+  }, [clearPrefetchedAudio]);
+
   const togglePlayPause = () => {
     if (!audioRef.current || !audioUrl) {
       if (pagesText.length > 0 && !isGeneratingAudio) {
-        playPage(currentPage, 0);
+        void playPage(currentPage, currentChunkIndex);
       }
       return;
     }
@@ -180,8 +303,7 @@ export default function App() {
 
   const handleAudioEnded = () => {
     setIsPlaying(false);
-    // Play next chunk or next page
-    playPage(currentPage, currentChunkIndex + 1);
+    void playPage(currentPage, currentChunkIndex + 1);
   };
 
   return (
@@ -194,11 +316,11 @@ export default function App() {
             </div>
             <h1 className="text-xl font-semibold tracking-tight">PDF to Audiobook</h1>
           </div>
-          
+
           <div className="flex items-center gap-4">
             <label className="text-sm font-medium text-stone-600">Voice:</label>
-            <select 
-              value={voice} 
+            <select
+              value={voice}
               onChange={(e) => setVoice(e.target.value as VoiceName)}
               className="bg-stone-100 border-none rounded-lg px-3 py-1.5 text-sm font-medium focus:ring-2 focus:ring-stone-900 outline-none cursor-pointer"
             >
@@ -225,12 +347,7 @@ export default function App() {
                 </p>
                 <p className="text-sm text-stone-500">PDF files only</p>
               </div>
-              <input 
-                type="file" 
-                className="hidden" 
-                accept="application/pdf" 
-                onChange={handleFileUpload} 
-              />
+              <input type="file" className="hidden" accept="application/pdf" onChange={handleFileUpload} />
             </label>
           </div>
         ) : (
@@ -253,21 +370,19 @@ export default function App() {
                   <h2 className="text-lg font-semibold truncate" title={file.name}>
                     {file.name}
                   </h2>
-                  <p className="text-sm text-stone-500 mt-1">
-                    {pagesText.length > 0 ? `${pagesText.length} Pages` : 'Processing...'}
-                  </p>
+                  <p className="text-sm text-stone-500 mt-1">{pagesText.length > 0 ? `${pagesText.length} Pages` : 'Processing...'}</p>
                 </div>
 
                 <div className="flex items-center justify-center gap-4">
-                  <button 
-                    onClick={() => playPage(currentPage - 1, 0)}
+                  <button
+                    onClick={() => void playPage(currentPage - 1, 0)}
                     disabled={currentPage === 0 || isExtracting || isGeneratingAudio || isGeneratingFullAudio}
                     className="p-3 rounded-full hover:bg-stone-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-stone-700"
                   >
                     <SkipBack size={24} fill="currentColor" />
                   </button>
-                  
-                  <button 
+
+                  <button
                     onClick={togglePlayPause}
                     disabled={isExtracting || pagesText.length === 0 || isGeneratingFullAudio}
                     className="w-16 h-16 rounded-full bg-stone-900 text-white flex items-center justify-center hover:bg-stone-800 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg active:scale-95"
@@ -280,9 +395,9 @@ export default function App() {
                       <Play size={28} fill="currentColor" className="ml-1" />
                     )}
                   </button>
-                  
-                  <button 
-                    onClick={() => playPage(currentPage + 1, 0)}
+
+                  <button
+                    onClick={() => void playPage(currentPage + 1, 0)}
                     disabled={currentPage === pagesText.length - 1 || isExtracting || isGeneratingAudio || isGeneratingFullAudio}
                     className="p-3 rounded-full hover:bg-stone-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-stone-700"
                   >
@@ -292,16 +407,16 @@ export default function App() {
 
                 <div className="mt-6 flex flex-col gap-3">
                   {audioUrl && (
-                    <a 
-                      href={audioUrl} 
-                      download={`${file.name.replace(/\.[^/.]+$/, "")}-page-${currentPage + 1}-part-${currentChunkIndex + 1}.wav`}
+                    <a
+                      href={audioUrl}
+                      download={`${file.name.replace(/\.[^/.]+$/, '')}-page-${currentPage + 1}-part-${currentChunkIndex + 1}.wav`}
                       className="flex items-center justify-center gap-2 px-4 py-2.5 bg-stone-100 hover:bg-stone-200 text-stone-700 rounded-xl text-sm font-medium transition-colors w-full"
                     >
                       <Download size={18} />
                       Download Current Audio
                     </a>
                   )}
-                  
+
                   <button
                     onClick={downloadFullAudiobook}
                     disabled={isExtracting || pagesText.length === 0 || isGeneratingAudio || isGeneratingFullAudio}
@@ -322,9 +437,9 @@ export default function App() {
                 </div>
 
                 {audioUrl && (
-                  <audio 
-                    ref={audioRef} 
-                    src={audioUrl} 
+                  <audio
+                    ref={audioRef}
+                    src={audioUrl}
                     onEnded={handleAudioEnded}
                     onPause={() => setIsPlaying(false)}
                     onPlay={() => setIsPlaying(true)}
@@ -333,40 +448,24 @@ export default function App() {
                 )}
               </div>
 
-              {error && (
-                <div className="bg-red-50 text-red-700 p-4 rounded-xl text-sm border border-red-100">
-                  {error}
-                </div>
-              )}
+              {error && <div className="bg-red-50 text-red-700 p-4 rounded-xl text-sm border border-red-100">{error}</div>}
             </div>
 
             {/* Right Column: Text Content */}
             <div className="lg:col-span-2">
               <div className="bg-white rounded-2xl shadow-sm border border-stone-200 overflow-hidden h-[calc(100vh-12rem)] flex flex-col">
                 <div className="px-6 py-4 border-b border-stone-100 bg-stone-50/50 flex items-center justify-between">
-                  <h3 className="font-medium text-stone-700">
-                    Page {currentPage + 1} of {Math.max(1, pagesText.length)}
-                  </h3>
-                  {pagesText.length > 0 && (
-                    <div className="text-xs font-mono text-stone-400">
-                      {pagesText[currentPage]?.length || 0} chars
-                    </div>
-                  )}
+                  <h3 className="font-medium text-stone-700">Page {currentPage + 1} of {Math.max(1, pagesText.length)}</h3>
+                  {pagesText.length > 0 && <div className="text-xs font-mono text-stone-400">{pagesText[currentPage]?.length || 0} chars</div>}
                 </div>
-                
+
                 <div className="p-8 overflow-y-auto flex-1 text-stone-800 leading-relaxed text-lg font-serif">
                   {isExtracting ? (
-                    <div className="h-full flex items-center justify-center text-stone-400">
-                      Reading document...
-                    </div>
+                    <div className="h-full flex items-center justify-center text-stone-400">Reading document...</div>
                   ) : pagesText.length > 0 ? (
-                    <div className="whitespace-pre-wrap">
-                      {pagesText[currentPage]}
-                    </div>
+                    <div className="whitespace-pre-wrap">{pagesText[currentPage]}</div>
                   ) : (
-                    <div className="h-full flex items-center justify-center text-stone-400">
-                      No text found.
-                    </div>
+                    <div className="h-full flex items-center justify-center text-stone-400">No text found.</div>
                   )}
                 </div>
               </div>
