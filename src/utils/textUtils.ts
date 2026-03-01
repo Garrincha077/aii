@@ -1,36 +1,78 @@
 export function chunkText(text: string, maxLength = 4000): string[] {
-  if (text.length <= maxLength) return [text];
+  const normalizedText = text.trim();
+
+  if (!normalizedText) return [];
+  if (normalizedText.length <= maxLength) return [normalizedText];
 
   const chunks: string[] = [];
-  let currentChunk = '';
-  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+  const paragraphs = normalizedText
+    .split(/\n\s*\n+/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
 
-  for (const sentence of sentences) {
-    if ((currentChunk + sentence).length > maxLength) {
-      if (currentChunk) {
-        chunks.push(currentChunk.trim());
-        currentChunk = '';
-      }
-      // If a single sentence is longer than maxLength, we have to split it by words
-      if (sentence.length > maxLength) {
-        const words = sentence.split(' ');
-        for (const word of words) {
-          if ((currentChunk + (currentChunk ? ' ' : '') + word).length > maxLength) {
-            chunks.push(currentChunk.trim());
-            currentChunk = '';
-          }
-          currentChunk += (currentChunk ? ' ' : '') + word;
-        }
-      } else {
-        currentChunk = sentence;
-      }
-    } else {
-      currentChunk += sentence;
+  for (const paragraph of paragraphs) {
+    if (paragraph.length <= maxLength) {
+      chunks.push(paragraph);
+      continue;
     }
-  }
 
-  if (currentChunk) {
-    chunks.push(currentChunk.trim());
+    const sentences =
+      paragraph.match(/[^.!?\n]+(?:[.!?]+|$)/g)?.map((sentence) => sentence.trim()).filter(Boolean) ||
+      [paragraph];
+
+    let currentChunk = '';
+
+    const pushCurrentChunk = () => {
+      if (!currentChunk) return;
+      chunks.push(currentChunk.trim());
+      currentChunk = '';
+    };
+
+    for (const sentence of sentences) {
+      if (sentence.length > maxLength) {
+        pushCurrentChunk();
+
+        const words = sentence.split(/\s+/).filter(Boolean);
+        let wordChunk = '';
+
+        for (const word of words) {
+          const candidate = wordChunk ? `${wordChunk} ${word}` : word;
+
+          if (candidate.length > maxLength) {
+            if (wordChunk) {
+              chunks.push(wordChunk);
+              wordChunk = '';
+            }
+
+            if (word.length > maxLength) {
+              for (let i = 0; i < word.length; i += maxLength) {
+                chunks.push(word.slice(i, i + maxLength));
+              }
+            } else {
+              wordChunk = word;
+            }
+          } else {
+            wordChunk = candidate;
+          }
+        }
+
+        if (wordChunk) {
+          chunks.push(wordChunk);
+        }
+
+        continue;
+      }
+
+      const candidate = currentChunk ? `${currentChunk} ${sentence}` : sentence;
+      if (candidate.length > maxLength) {
+        pushCurrentChunk();
+        currentChunk = sentence;
+      } else {
+        currentChunk = candidate;
+      }
+    }
+
+    pushCurrentChunk();
   }
 
   return chunks;
